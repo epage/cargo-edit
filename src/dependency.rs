@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::manifest::str_or_1_len_table;
+use crate::version::upgrade_requirement;
 
 /// A dependency handled by Cargo
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -18,6 +19,9 @@ pub struct Dependency {
 
     /// Features that are exposed by the dependency
     pub available_features: Vec<String>,
+
+    /// Requirement from the manifest file for determining a new requirement's precision
+    requirement: Option<String>,
 }
 
 impl Dependency {
@@ -141,6 +145,13 @@ impl Dependency {
             path: old_path,
             registry: Some(registry.into()),
         };
+        self
+    }
+
+    /// Set the dependency's requirement
+    #[must_use]
+    pub fn set_requirement(mut self, req: &str) -> Dependency {
+        self.requirement = Some(req.to_owned());
         self
     }
 
@@ -282,6 +293,7 @@ impl Dependency {
                 features,
                 available_features,
                 optional,
+                requirement: None,
             };
             Some(dep)
         } else {
@@ -330,7 +342,7 @@ impl Dependency {
                     registry: None,
                 },
                 None,
-            ) => toml_edit::value(v),
+            ) => toml_edit::value(self.restrict_version(&v)),
             // Other cases are represented as an inline table
             (_, _, _, _, _) => {
                 let mut data = toml_edit::InlineTable::default();
@@ -342,7 +354,7 @@ impl Dependency {
                         registry,
                     } => {
                         if let Some(v) = version {
-                            data.insert("version", v.into());
+                            data.insert("version", self.restrict_version(v).into());
                         }
                         if let Some(p) = path {
                             let relpath = path_field(crate_root, p);
@@ -414,7 +426,7 @@ impl Dependency {
                     registry,
                 } => {
                     if let Some(v) = version {
-                        table.insert("version", toml_edit::value(v));
+                        table.insert("version", toml_edit::value(self.restrict_version(v)));
                     } else {
                         table.remove("version");
                     }
@@ -500,6 +512,17 @@ impl Dependency {
             unreachable!("Invalid dependency type: {}", item.type_name());
         }
     }
+
+    fn restrict_version(&self, v: &str) -> String {
+        if let Some(req) = &self.requirement {
+            let version = semver::Version::parse(v).expect("version to parse");
+            upgrade_requirement(req, &version)
+                .expect("requirement to be upgraded")
+                .unwrap_or_else(|| req.clone())
+        } else {
+            v.to_owned()
+        }
+    }
 }
 
 fn path_field(crate_root: &Path, abs_path: &Path) -> String {
@@ -532,6 +555,7 @@ impl Default for Dependency {
                 registry: None,
             },
             available_features: vec![],
+            requirement: None,
         }
     }
 }

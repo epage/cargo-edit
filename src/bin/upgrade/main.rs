@@ -165,10 +165,17 @@ impl Args {
             resolve_local_one(self.manifest_path.as_deref())
         }
     }
+
+    fn preserve_precision(&self) -> bool {
+        self.unstable_features
+            .contains(&UnstableOptions::PreservePrecision)
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ArgEnum)]
-enum UnstableOptions {}
+enum UnstableOptions {
+    PreservePrecision,
+}
 
 #[test]
 fn verify_app() {
@@ -194,13 +201,14 @@ fn process(args: Args) -> Result<()> {
     } else {
         load_lockfile(&manifests).unwrap_or_default()
     };
+    let preserve_precision = args.preserve_precision();
 
     let mut updated_registries = BTreeSet::new();
     for (manifest, package) in manifests {
         let existing_dependencies = get_dependencies(&package, &args.dependency, &args.exclude)?;
 
         let upgraded_dependencies = if args.to_lockfile {
-            existing_dependencies.into_lockfile(&locked)?
+            existing_dependencies.into_lockfile(&locked, preserve_precision)?
         } else {
             // Update indices for any alternative registries, unless
             // we're offline.
@@ -221,8 +229,11 @@ fn process(args: Args) -> Result<()> {
                 }
             }
 
-            existing_dependencies
-                .into_latest(args.allow_prerelease, &find(args.manifest_path.as_deref())?)?
+            existing_dependencies.into_latest(
+                args.allow_prerelease,
+                &find(args.manifest_path.as_deref())?,
+                preserve_precision,
+            )?
         };
 
         upgrade(
@@ -374,14 +385,19 @@ struct DesiredUpgrades(BTreeMap<Dependency, UpgradeMetadata>);
 impl DesiredUpgrades {
     /// Transform the dependencies into their upgraded forms. If a version is specified, all
     /// dependencies will get that version.
-    fn into_latest(self, allow_prerelease: bool, manifest_path: &Path) -> Result<ActualUpgrades> {
+    fn into_latest(
+        self,
+        allow_prerelease: bool,
+        manifest_path: &Path,
+        preserve_precision: bool,
+    ) -> Result<ActualUpgrades> {
         let mut upgrades = ActualUpgrades::default();
         for (
             dep,
             UpgradeMetadata {
                 registry,
                 version,
-                old_version: _,
+                old_version,
                 is_prerelease,
             },
         ) in self.0.into_iter()
@@ -406,16 +422,26 @@ impl DesiredUpgrades {
                 registry_url.as_ref(),
             )
             .chain_err(|| "Failed to get new version")?;
-            let version = latest
-                .version()
-                .expect("Invalid dependency type")
-                .to_string();
-            upgrades.0.insert(dep, version);
+            let latest_version = latest.version().expect("Invalid dependency type");
+            if preserve_precision {
+                let latest_version: semver::Version = latest_version.parse()?;
+                if let Some(version) =
+                    cargo_edit::upgrade_requirement(&old_version.to_string(), &latest_version)?
+                {
+                    upgrades.0.insert(dep, version);
+                }
+            } else {
+                upgrades.0.insert(dep, latest_version.to_owned());
+            }
         }
         Ok(upgrades)
     }
 
-    fn into_lockfile(self, locked: &[cargo_metadata::Package]) -> Result<ActualUpgrades> {
+    fn into_lockfile(
+        self,
+        locked: &[cargo_metadata::Package],
+        preserve_precision: bool,
+    ) -> Result<ActualUpgrades> {
         let mut upgrades = ActualUpgrades::default();
         for (
             dep,
@@ -436,7 +462,17 @@ impl DesiredUpgrades {
                 // The requested dependency may be present in the lock file with different versions,
                 // but only one will be semver-compatible with the requested version.
                 if dep.name == p.name && old_version.matches(&p.version) {
-                    upgrades.0.insert(dep, p.version.to_string());
+                    let locked_version = &p.version;
+                    if preserve_precision {
+                        if let Some(version) = cargo_edit::upgrade_requirement(
+                            &old_version.to_string(),
+                            &locked_version,
+                        )? {
+                            upgrades.0.insert(dep, version);
+                        }
+                    } else {
+                        upgrades.0.insert(dep, locked_version.to_string());
+                    }
                     break;
                 }
             }
